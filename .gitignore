@@ -9,6 +9,7 @@ build/
 
 # Virtual environments
 .venv/
+.venv-psim-bridge/
 venv/
 env/
 

@@ -29,6 +29,7 @@ _MAX_CONSECUTIVE_FAILURES = 5
 _CIRCUIT_BREAKER_COOLDOWN = 30.0  # seconds before HALF_OPEN probe
 _LOCK_ACQUIRE_TIMEOUT = 10.0  # seconds to wait for asyncio.Lock
 _MAX_RESTARTS = 10  # lifetime restart cap
+_BRIDGE_STREAM_LIMIT = 64 * 1024 * 1024  # max bytes for one bridge response line
 
 
 class CircuitState(Enum):
@@ -241,6 +242,8 @@ class RealPsimAdapter(BasePsimAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=self._get_sanitized_env(),
+                # converted scripts travel as one JSON line; default limit is 64 KiB
+                limit=_BRIDGE_STREAM_LIMIT,
             )
         except FileNotFoundError as exc:
             logger.error("Bridge executable not found: %s", cmd)
@@ -351,41 +354,46 @@ class RealPsimAdapter(BasePsimAdapter):
                 proc.stdin.write((payload + "\n").encode())
                 await proc.stdin.drain()
 
-            try:
-                raw = await asyncio.wait_for(
-                    proc.stdout.readline(),
-                    timeout=self._timeout,
-                )
-            except asyncio.TimeoutError:
-                logger.error("Bridge call timed out: action=%s", action)
+            deadline = asyncio.get_running_loop().time() + self._timeout
+            while True:
                 try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                self._process = None
-                self._clear_project_state()
-                error_msg = f"PSIM bridge timed out after {self._timeout}s for action '{action}'"
-                self._record_failure(error_msg)
-                raise TimeoutError(error_msg) from None
+                    raw = await asyncio.wait_for(
+                        proc.stdout.readline(),
+                        timeout=max(0, deadline - asyncio.get_running_loop().time()),
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Bridge call timed out: action=%s", action)
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    self._process = None
+                    self._clear_project_state()
+                    error_msg = (
+                        f"PSIM bridge timed out after {self._timeout}s for action '{action}'"
+                    )
+                    self._record_failure(error_msg)
+                    raise TimeoutError(error_msg) from None
 
-            if not raw:
-                logger.error("Bridge returned empty response (process may have crashed)")
-                self._process = None
-                self._clear_project_state()
-                error_msg = (
-                    f"PSIM bridge returned empty response for action '{action}'. "
-                    "The bridge process may have crashed."
-                )
-                self._record_failure(error_msg)
-                raise RuntimeError(error_msg)
+                if not raw:
+                    logger.error("Bridge returned empty response (process may have crashed)")
+                    self._process = None
+                    self._clear_project_state()
+                    error_msg = (
+                        f"PSIM bridge returned empty response for action '{action}'. "
+                        "The bridge process may have crashed."
+                    )
+                    self._record_failure(error_msg)
+                    raise RuntimeError(error_msg)
 
-            try:
-                result = json.loads(raw.decode())
-            except json.JSONDecodeError as exc:
-                logger.error("Bridge returned invalid JSON: %s", raw[:500])
-                error_msg = f"PSIM bridge returned invalid JSON for action '{action}': {exc}"
-                self._record_failure(error_msg)
-                raise RuntimeError(error_msg) from exc
+                try:
+                    result = json.loads(raw.decode())
+                    break
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    # PSIM 2025 writes native diagnostic lines directly to stdout,
+                    # bypassing Python's redirected sys.stdout. Preserve the JSONL
+                    # protocol by treating those lines as diagnostics.
+                    logger.warning("Ignoring non-JSON bridge output: %s", raw[:500])
 
             self._record_success()
             return result

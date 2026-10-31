@@ -141,3 +141,20 @@ class TestNetReconstruction:
         assert result.stats["nets"] == 1
         assert result.stats["dangling_pins"] == 3
         assert result.stats["connected_pins"] == 3
+
+
+class TestEmptySubcircuitPathSyntax:
+    def test_statement_glued_after_empty_path_is_split(self):
+        script = (
+            "if True:\n"
+            '\t\tstrSubPath = str_save_FolderPath + "" \t\tMakeSub_(p1, strSubPath)\n'
+            '\t\tstrSubFilePath = str_save_FolderPath + "" \t\t'
+            'nCreatedIndex = p1.PsimCreateNewElement(sch, "MULTI_RESISTOR", "R1", '
+            'PORTS=[0, 0, 50, 0], Resistance = "10")\n'
+        )
+        parsed = parse_converted_script(script)
+        assert [c.id for c in parsed.components] == ["R1"]
+        assert parsed.components[0].parameters == {"Resistance": "10"}
+
+    def test_well_formed_script_unchanged(self):
+        assert len(parse_converted_script(_BASIC).components) == 3

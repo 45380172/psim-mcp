@@ -33,6 +33,8 @@ import os
 import sys
 import time
 import traceback
+import ctypes
+
 
 # Per-component parameter-name mapping (single source of truth).
 # Maps MCP parameter names -> PSIM parameter names per component type.
@@ -110,6 +112,15 @@ _COMPONENT_PARAM_MAP = {
     "SimControl": {
         "TIMESTEP": "TimeStep",
         "TOTALTIME": "TotalTime",
+    },
+    # PSIM's z-domain transfer-function element exposes its coefficient
+    # vectors as display names containing punctuation.  Keep concise MCP
+    # aliases here because the public tool validates identifier-like names.
+    "TFCTN_D": {
+        "order": "Order N",
+        "b": "Coeff. b0..bN",
+        "a": "Coeff. a0..aN",
+        "fs": "Sampling Frequency",
     },
 }
 
@@ -198,6 +209,138 @@ _current_path = None
 _element_cache = {}  # name → type 매핑 (set_parameter에서 component_type 자동 조회용)
 
 
+def _read_element_list_compat(psim, schematic, flag):
+    """Read elements around the PSIM 2025 wheel's Python 3.12 buffer bug."""
+    sch_handle = schematic.value
+    reload_elements = getattr(psim.psimHandle, "PsimReloadElementList2")
+    reload_elements.restype = ctypes.c_int
+    count = reload_elements(sch_handle, flag)
+
+    get_element = getattr(psim.psimHandle, "PsimGetElmement")
+    get_element.restype = ctypes.c_int
+    get_element.argtypes = [
+        ctypes.c_int, ctypes.c_int,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_wchar)),
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_wchar)), ctypes.POINTER(ctypes.c_int),
+    ]
+    get_param = getattr(psim.psimHandle, "PsimGetElmParam")
+    get_param.restype = ctypes.c_int
+    get_param.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_wchar)),
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_wchar)),
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+    ]
+
+    elements = []
+    for element_index in range(count):
+        type_buffer = (ctypes.c_wchar * 100)()
+        name_buffer = (ctypes.c_wchar * 100)()
+        type_pointer = ctypes.cast(type_buffer, ctypes.POINTER(ctypes.c_wchar))
+        name_pointer = ctypes.cast(name_buffer, ctypes.POINTER(ctypes.c_wchar))
+        parameter_count = ctypes.c_int(0)
+        get_element(sch_handle, element_index, ctypes.byref(type_pointer),
+                    ctypes.byref(name_pointer), ctypes.byref(parameter_count))
+        element = type("PsimElement", (), {})()
+        element.Type, element.Name, element.Index, element.Params = (
+            type_buffer.value, name_buffer.value, element_index, [])
+
+        for parameter_index in range(parameter_count.value):
+            variable_name_buffer = (ctypes.c_wchar * 101)()
+            variable_name_pointer = ctypes.cast(variable_name_buffer, ctypes.POINTER(ctypes.c_wchar))
+            value_length = ctypes.c_int(100)
+            options = ctypes.c_int(0)
+
+            def read_value(buffer_length):
+                value_buffer = (ctypes.c_wchar * buffer_length)()
+                value_pointer = ctypes.cast(value_buffer, ctypes.POINTER(ctypes.c_wchar))
+                result = get_param(
+                    sch_handle, element_index, 0, parameter_index,
+                    ctypes.byref(variable_name_pointer), ctypes.byref(value_pointer),
+                    ctypes.byref(value_length), ctypes.byref(options),
+                )
+                return result, value_buffer
+
+            result, value_buffer = read_value(value_length.value)
+            if result == 2:
+                value_length = ctypes.c_int(value_length.value + 10)
+                result, value_buffer = read_value(value_length.value)
+            if result == 1:
+                parameter = type("PsimParameter", (), {})()
+                parameter.Name = variable_name_buffer.value
+                parameter.Value = value_buffer.value
+                parameter.Options = options.value
+                element.Params.append(parameter)
+        elements.append(element)
+    return elements
+
+
+def _get_element_list(psim, schematic, flag):
+    """Prefer the vendor API; use the equivalent corrected reader if needed."""
+    try:
+        return psim.PsimGetElementList(schematic, flag)
+    except Exception as exc:
+        if "PyCArrayType" not in str(exc):
+            raise
+        return _read_element_list_compat(psim, schematic, flag)
+
+
+def _element_list_fallback_script(psim, schematic):
+    """Build a component/parameter script when PSIM lacks the converter.
+
+    The psimapipy 2026 wrapper removed ``PsimConvertToPython``, but the PSIM
+    2025 DLL still exports ``ConvertToPythonW`` (see ``_convert_via_dll``);
+    this fallback is only used when neither is available.  The public
+    element-list API still exposes every component and parameter, but not
+    wire geometry.  Return a valid partial script so import_circuit remains
+    usable and reports the missing connectivity as an empty-net graph instead
+    of failing with an AttributeError.
+    """
+    elements = _get_element_list(psim, schematic, 0) or []
+    lines = ["# Fallback generated by psim_mcp (PSIM converter unavailable)", ""]
+    for element in elements:
+        elem_type = repr(str(getattr(element, "Type", "")))
+        elem_name = repr(str(getattr(element, "Name", "")))
+        if str(getattr(element, "Type", "")).upper().replace(" ", "") in ("SIMCONTROL", "SIMULATIONCONTROL"):
+            continue
+        lines.append(
+            "p1.PsimCreateNewElement(sch, %s, %s, PORTS=[])" % (elem_type, elem_name)
+        )
+        for param in getattr(element, "Params", []) or []:
+            lines.append(
+                "p1.PsimSetElmValue2(sch, %s, %s, %r, %r)"
+                % (elem_type, elem_name, str(param.Name), str(param.Value))
+            )
+    for element in elements:
+        if False:
+            continue
+        if str(getattr(element, "Type", "")).upper().replace(" ", "") in ("SIMCONTROL", "SIMULATIONCONTROL"):
+            for param in getattr(element, "Params", []) or []:
+                lines.append(
+                    "p1.PsimSetElmValue(sch, None, %r, %r)"
+                    % (str(param.Name), str(param.Value))
+                )
+    return "\n".join(lines) + "\n"
+
+
+def _convert_via_dll(psim, path, output_path):
+    """Call the DLL's ``ConvertToPythonW`` directly; True on success.
+
+    Returns False when ``psimHandle`` or the export is missing, the call
+    raises, returns 0 (error), or writes no output file.
+    """
+    handle = getattr(psim, "psimHandle", None)
+    func = getattr(handle, "ConvertToPythonW", None) if handle is not None else None
+    if func is None:
+        return False
+    try:
+        func.restype = ctypes.c_int
+        ret = func(ctypes.c_wchar_p(path), ctypes.c_wchar_p(output_path))
+    except Exception:
+        return False
+    return bool(ret) and os.path.isfile(output_path)
+
+
 def _build_element_cache():
     """열린 schematic의 모든 소자를 캐시한다 (name → type 매핑)."""
     global _element_cache
@@ -206,7 +349,7 @@ def _build_element_cache():
         return
     try:
         p = _get_psim()
-        elm_list = p.PsimGetElementList(_current_sch, 0)
+        elm_list = _get_element_list(p, _current_sch, 0)
         if elm_list:
             _element_cache = {elem.Name: elem.Type for elem in elm_list}
     except Exception:
@@ -251,7 +394,10 @@ def _get_psim():
         )
 
     psim_path = os.environ.get("PSIM_PATH", "")
-    p = PSIM(psim_path)
+    # Older psimapipy releases print the PSIM version during construction.
+    # Keep stdout reserved for the JSON-lines bridge protocol.
+    with _suppress_stdout():
+        p = PSIM(psim_path)
 
     if not p or not p.IsValid():
         raise RuntimeError(
@@ -294,7 +440,7 @@ def handle_open_project(params):
         # 소자 목록 조회
         components = []
         try:
-            elm_list = p.PsimGetElementList(sch, 0)
+            elm_list = _get_element_list(p, sch, 0)
             if elm_list:
                 for elem in elm_list:
                     comp = {
@@ -396,7 +542,10 @@ def handle_run_simulation(params):
     try:
         p = _get_psim()
 
-        # 시뮬레이션 대상 결정
+        # 시뮬레이션 대상 결정.  PSIM 2025에서 새 브리지가
+        # PsimFileOpen으로 반환된 schematic COM object를 PsimSimulate에
+        # 넘기면 ``schFilePath`` 관련 native exception이 발생할 수 있다.
+        # 파일 경로를 직접 넘기면 이 상태에서도 시뮬레이션이 일관되게 실행된다.
         sim_target = _current_sch if _current_sch else sch_path
 
         # 출력 경로가 없으면 기본값 생성
@@ -424,7 +573,8 @@ def handle_run_simulation(params):
                 sim_kwargs[key] = val
 
         start_time = time.time()
-        result = p.PsimSimulate(sim_target, output_path, **sim_kwargs)
+        simulate_arg = sch_path if sch_path else sim_target
+        result = p.PsimSimulate(simulate_arg, output_path, **sim_kwargs)
         duration = time.time() - start_time
 
         if result.Result == 0:
@@ -521,7 +671,8 @@ def handle_get_status(params):
     try:
         p = _get_psim()
         ver, sub, subsub, subsubsub = p.get_psim_version()
-        version_name = p.get_psim_version_name()
+        get_version_name = getattr(p, "get_psim_version_name", None)
+        version_name = get_version_name() if get_version_name else None
 
         return _success(
             {
@@ -564,7 +715,7 @@ def handle_get_project_info(params):
 
         # 소자 목록
         components = []
-        elm_list = p.PsimGetElementList(_current_sch, 0)
+        elm_list = _get_element_list(p, _current_sch, 0)
         if elm_list:
             for elem in elm_list:
                 comp = {
@@ -612,20 +763,34 @@ def handle_convert_to_python(params):
 
     try:
         p = _get_psim()
-        ret = p.PsimConvertToPython(path, output_path)
-        if not os.path.isfile(output_path):
-            return _error(
-                "CONVERT_FAILED",
-                "PsimConvertToPython이 출력 파일을 생성하지 못했습니다 (ret=%s)." % ret,
-            )
-        with open(output_path, "r", encoding="utf-8", errors="replace") as f:
-            script_text = f.read()
+        converter = getattr(p, "PsimConvertToPython", None)
+        connectivity_complete = converter is not None
+        if converter is not None:
+            ret = converter(path, output_path)
+            if not os.path.isfile(output_path):
+                return _error(
+                    "CONVERT_FAILED",
+                    "PsimConvertToPython이 출력 파일을 생성하지 못했습니다 (ret=%s)." % ret,
+                )
+            with open(output_path, "r", encoding="utf-8", errors="replace") as f:
+                script_text = f.read()
+        else:
+            # psimapipy 2026 dropped the wrapper; the DLL export still works.
+            connectivity_complete = _convert_via_dll(p, path, output_path)
+            if connectivity_complete:
+                with open(output_path, "r", encoding="utf-8", errors="replace") as f:
+                    script_text = f.read()
+            else:
+                script_text = _element_list_fallback_script(p, p.PsimFileOpen(path))
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(script_text)
         return _success(
             {
                 "source_path": path,
                 "script_path": output_path,
                 "script_text": script_text,
                 "size": len(script_text),
+                "connectivity_complete": connectivity_complete,
             }
         )
     except Exception as e:

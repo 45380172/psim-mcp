@@ -37,6 +37,7 @@ _LAYOUT_KEYS = {
 }
 
 _COORD_KEY = re.compile(r"^[XY]\d+$")
+_EMPTY_SUBPATH_JOIN = re.compile(r'(\+ "")[ \t]+(?=\S)')
 
 
 @dataclass
@@ -114,6 +115,9 @@ class _Evaluator:
 
 def parse_converted_script(text: str) -> ParsedSchematic:
     """Parse a PsimConvertToPython-generated script into a ParsedSchematic."""
+    # PSIM's converter emits `+ ""` followed by a tab and the next statement on
+    # the same line when a subcircuit file name is empty; split them apart.
+    text = _EMPTY_SUBPATH_JOIN.sub(r"\1\n\t\t", text)
     tree = ast.parse(text)
     evaluator = _Evaluator(tree)
 
